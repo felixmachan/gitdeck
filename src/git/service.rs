@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use git2::{BranchType, Repository, Sort, Status, StatusOptions};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::models::domain::{
     BranchInfo, CommitDetails, CommitSummary, RepoOperation, RepoSummary, WorkingTreeStatus,
 };
+use crate::models::graph::{GraphData, GraphNode};
 
 pub struct GitService {
     repo: Repository,
@@ -155,6 +157,75 @@ impl GitService {
             true
         })?;
         Ok(count)
+    }
+
+    pub fn graph_data(&self, limit: usize) -> Result<GraphData> {
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)?;
+        let _ = revwalk.push_glob("*");
+
+        let mut nodes = Vec::new();
+        let mut branches_map = HashMap::new();
+        let mut branch_colors = Vec::new();
+        let mut current_color = 0;
+
+        for oid_result in revwalk.take(limit) {
+            let oid = oid_result?;
+            let commit = self.repo.find_commit(oid)?;
+            
+            let mut branch_name = "unknown".to_string();
+            if let Ok(branches) = self.repo.branches(Some(BranchType::Local)) {
+                for b in branches {
+                    if let Ok((b, _)) = b {
+                        if b.get().target() == Some(oid) {
+                            branch_name = b.name().ok().flatten().unwrap_or("").to_string();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let color_idx = *branches_map.entry(branch_name.clone()).or_insert_with(|| {
+                let idx = current_color;
+                branch_colors.push((branch_name.clone(), idx));
+                current_color += 1;
+                idx
+            });
+
+            nodes.push(GraphNode {
+                id: oid.to_string(),
+                short_id: format!("{oid:.8}"),
+                parents: commit.parents().map(|p| p.id().to_string()).collect(),
+                children: Vec::new(),
+                branch: branch_name,
+                subject: commit.summary().unwrap_or("").to_string(),
+                lane: color_idx % 5,
+                color_idx,
+            });
+        }
+
+        let node_ids: HashMap<String, usize> = nodes.iter().enumerate().map(|(i, n)| (n.id.clone(), i)).collect();
+        for i in 0..nodes.len() {
+            let child_id = nodes[i].id.clone();
+            let parents = nodes[i].parents.clone();
+            for p_id in parents {
+                if let Some(&p_idx) = node_ids.get(&p_id) {
+                    nodes[p_idx].children.push(child_id.clone());
+                }
+            }
+        }
+
+        Ok(GraphData {
+            nodes,
+            branches: branch_colors,
+        })
+    }
+
+    pub fn graph_log(&self) -> Result<String> {
+        let output = std::process::Command::new("git")
+            .args(["log", "--graph", "--oneline", "--all", "--decorate", "--color=always"])
+            .output()?;
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     fn collect_status(&self) -> Result<WorkingTreeStatus> {

@@ -5,10 +5,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{io, time::Duration};
+use std::{io, time::Duration, sync::mpsc, fs};
 
 use crate::{
-    commands::{command_catalog, execute_preview, BuilderFocus, BuilderState, DangerLevel, TargetType},
+    commands::{command_catalog, start_command_stream, BuilderFocus, BuilderState, DangerLevel, TargetType},
     config::theme::Theme,
     git::GitService,
     models::{
@@ -19,10 +19,13 @@ use crate::{
 };
 
 pub struct App {
-    git: GitService,
+    pub git: GitService,
     pub theme: Theme,
     pub focus: FocusPane,
     pub show_help: bool,
+    pub show_settings: bool,
+    pub show_graph: bool,
+    pub separate_terminal: bool,
     pub query: String,
     pub command_mode: bool,
     pub should_quit: bool,
@@ -35,6 +38,7 @@ pub struct App {
 
     pub branches: Vec<BranchInfo>,
     pub selected_branch: usize,
+    pub graph_data: String,
 
     pub commands: Vec<crate::commands::CommandSpec>,
     pub builder: BuilderState,
@@ -42,12 +46,17 @@ pub struct App {
     pub confirm_required: bool,
     pub status_message: String,
     pub terminal_scroll: u16,
+
+    pub rx: mpsc::Receiver<String>,
+    tx: mpsc::Sender<String>,
+    terminal_started: bool,
 }
 
 impl App {
     pub fn new() -> Result<Self> {
         let git = GitService::discover(".")?;
         let commands = command_catalog();
+        let (tx, rx) = mpsc::channel();
 
         let mut app = Self {
             repo: git.repo_summary()?,
@@ -57,11 +66,15 @@ impl App {
             selected_commit: 0,
             branches: git.branches()?,
             selected_branch: 0,
+            graph_data: git.graph_log()?,
             commands,
             builder: BuilderState::new(),
             command_output: String::new(),
             command_mode: false,
             show_help: false,
+            show_settings: false,
+            show_graph: false,
+            separate_terminal: false,
             query: String::new(),
             should_quit: false,
             confirm_required: false,
@@ -70,6 +83,9 @@ impl App {
             theme: Theme::default(),
             git,
             terminal_scroll: 0,
+            tx,
+            rx,
+            terminal_started: false,
         };
 
         app.refresh_derived_state()?;
@@ -88,14 +104,24 @@ impl App {
         disable_raw_mode()?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         terminal.show_cursor()?;
+        
+        let _ = fs::remove_file("gitdeck_cmd.bat");
+        let _ = fs::write("gitdeck_exit.txt", "exit");
+        
         result
     }
 
     fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         while !self.should_quit {
+            while let Ok(line) = self.rx.try_recv() {
+                self.command_output.push_str(&line);
+                self.command_output.push('\n');
+                self.terminal_scroll = 0;
+            }
+
             terminal.draw(|f| ui::render(f, self))?;
 
-            if event::poll(Duration::from_millis(100))? {
+            if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         self.handle_key(key.code, key.modifiers)?;
@@ -115,6 +141,13 @@ impl App {
             return Ok(());
         }
 
+        if self.show_graph {
+            if matches!(code, KeyCode::Char('g') | KeyCode::Esc | KeyCode::Char('q')) {
+                self.show_graph = false;
+            }
+            return Ok(());
+        }
+
         if self.command_mode {
             return self.handle_command_builder_input(code, modifiers);
         }
@@ -125,6 +158,15 @@ impl App {
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.prev(),
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('s') => self.show_settings = !self.show_settings,
+            KeyCode::Char('g') => {
+                self.graph_data = self.git.graph_log().unwrap_or_else(|_| "Error loading graph".to_string());
+                self.show_graph = true;
+            }
+            KeyCode::Char('t') if self.show_settings => {
+                self.separate_terminal = !self.separate_terminal;
+                self.status_message = format!("Terminal mode: {}", if self.separate_terminal { "Separate" } else { "Mini" });
+            }
             KeyCode::Char('/') => {
                 self.query.clear();
                 self.status_message = "Filter history by typing; Enter applies".to_string();
@@ -134,7 +176,7 @@ impl App {
                 self.command_mode = true;
             }
             KeyCode::Char('h') => self.focus = FocusPane::History,
-            KeyCode::Char('g') => self.focus = FocusPane::Branches,
+            KeyCode::Char('b') => self.focus = FocusPane::Branches,
             KeyCode::Char('d') => self.focus = FocusPane::Details,
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
@@ -158,7 +200,14 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> Result<()> {
-        let selected = &self.commands[self.builder.selected_command];
+        let (preview, base, is_dangerous) = {
+            let selected = &self.commands[self.builder.selected_command];
+            let preview = self.builder.preview_command(selected);
+            let is_dangerous = matches!(selected.docs.danger_level, DangerLevel::Dangerous)
+                || self.builder.option_enabled("force")
+                || self.builder.option_enabled("force_delete");
+            (preview, selected.base.clone(), is_dangerous)
+        };
 
         match code {
             KeyCode::Esc | KeyCode::Char('q') => {
@@ -166,6 +215,7 @@ impl App {
                 self.confirm_required = false;
             }
             KeyCode::Tab => {
+                let selected = &self.commands[self.builder.selected_command];
                 if selected.target_type != TargetType::None {
                     self.builder.focus = match self.builder.focus {
                         BuilderFocus::Options => BuilderFocus::Target,
@@ -174,6 +224,7 @@ impl App {
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                let selected = &self.commands[self.builder.selected_command];
                 match self.builder.focus {
                     BuilderFocus::Options => {
                         let max = selected.toggles.len().saturating_sub(1);
@@ -191,6 +242,7 @@ impl App {
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                let selected = &self.commands[self.builder.selected_command];
                 match self.builder.focus {
                     BuilderFocus::Options => {
                         self.builder.selected_option = self.builder.selected_option.saturating_sub(1);
@@ -212,6 +264,7 @@ impl App {
             }
             KeyCode::Char(' ') => {
                 if self.builder.focus == BuilderFocus::Options {
+                    let selected = &self.commands[self.builder.selected_command];
                     if let Some(opt) = selected.toggles.get(self.builder.selected_option) {
                         self.builder.toggle_option(opt.key);
                     }
@@ -220,11 +273,7 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                let preview = self.builder.preview_command(selected);
-                if matches!(selected.docs.danger_level, DangerLevel::Dangerous)
-                    || self.builder.option_enabled("force")
-                    || self.builder.option_enabled("force_delete")
-                {
+                if is_dangerous {
                     if !self.confirm_required {
                         self.confirm_required = true;
                         self.status_message =
@@ -233,12 +282,20 @@ impl App {
                     }
                 }
 
-                self.command_output = execute_preview(&preview).unwrap_or_else(|e| e.to_string());
-                self.status_message = format!("Executed: git {}", selected.base);
+                self.command_output.clear();
+                self.command_output.push_str(&format!("$ {}\n", preview));
+                
+                let tx = self.tx.clone();
+                if self.separate_terminal {
+                    self.execute_in_persistent_terminal(&preview);
+                } else {
+                    start_command_stream(&preview, tx);
+                }
+                
+                self.status_message = format!("Running: git {}", base);
                 self.confirm_required = false;
                 self.command_mode = false; 
-                self.terminal_scroll = 0; // Reset scroll for new output
-                self.refresh_repo_data()?;
+                self.terminal_scroll = 0;
             }
             KeyCode::Backspace => {
                 if self.builder.focus == BuilderFocus::Target {
@@ -254,6 +311,22 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn execute_in_persistent_terminal(&mut self, cmd: &str) {
+        let _ = fs::write("gitdeck_next.txt", cmd);
+        
+        if !self.terminal_started {
+            let proxy_script = "@echo off\ntitle GitDeck Terminal\necho GitDeck Terminal Session Started\n:loop\nif exist gitdeck_exit.txt exit\nif exist gitdeck_next.txt (\n  for /f \"usebackq delims=\" %%a in(\"gitdeck_next.txt\") do (\n    echo $ %%a\n    call %%a\n    del gitdeck_next.txt\n    echo.\n    echo Waiting for next command...\n  )\n)\ntimeout /t 1 /nobreak >nul\ngoto loop";
+            let _ = fs::write("gitdeck_cmd.bat", proxy_script);
+            let _ = fs::remove_file("gitdeck_exit.txt");
+            
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "start", "gitdeck_cmd.bat"])
+                .spawn();
+            
+            self.terminal_started = true;
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -336,7 +409,7 @@ impl App {
         self.selected_commit = 0;
     }
 
-    fn refresh_repo_data(&mut self) -> Result<()> {
+    pub fn refresh_repo_data(&mut self) -> Result<()> {
         self.repo = self.git.repo_summary()?;
         self.branches = self.git.branches()?;
         self.commits = self.git.commit_history(400)?;

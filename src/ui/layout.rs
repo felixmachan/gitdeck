@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
@@ -13,32 +13,115 @@ use crate::{
     models::{domain::RepoOperation, ui::FocusPane},
 };
 
+const GRAPH_COLORS: [Color; 6] = [
+    Color::Cyan,
+    Color::Green,
+    Color::Magenta,
+    Color::Yellow,
+    Color::Blue,
+    Color::Red,
+];
+
 pub fn render(frame: &mut Frame<'_>, app: &App) {
-    // Dinamikus magasság számítása: ha üres az output, kicsi a footer, ha van benne valami, nagyobb.
+    if app.show_graph {
+        render_horizontal_graph(frame, frame.area(), app);
+        return;
+    }
+
     let footer_height = if app.command_output.trim().is_empty() {
         3
     } else {
-        // Maximum 10 sor, de legalább 6, ha van kimenet
         let lines_count = app.command_output.lines().count() as u16;
         (lines_count + 4).min(10).max(6)
     };
 
+    let area = frame.area();
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Fill(1), // Ez a rész (a body) kap meg minden maradék helyet
+            Constraint::Length(1),
+            Constraint::Fill(1),
             Constraint::Length(footer_height),
         ])
-        .split(frame.area());
+        .split(area);
 
     render_top_status(frame, root[0], app);
-    render_body(frame, root[1], app);
-    render_footer(frame, root[2], app);
+    render_info_bar(frame, root[1], app);
+    render_body(frame, root[2], app);
+    render_footer(frame, root[3], app);
 
     if app.show_help {
-        render_help_overlay(frame, centered_rect(70, 70, frame.area()), app);
+        render_help_overlay(frame, centered_rect(70, 70, area), app);
     }
+}
+
+fn render_horizontal_graph(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
+
+    let graph = match app.git.graph_data(50) {
+        Ok(data) => data,
+        Err(_) => {
+            frame.render_widget(Paragraph::new("Failed to load graph data"), area);
+            return;
+        }
+    };
+
+    let mut lines = Vec::new();
+    
+    // 1. Legend
+    let mut legend_spans = vec![Span::raw("Legend: ")];
+    for (name, color_idx) in &graph.branches {
+        legend_spans.push(Span::styled(
+            format!(" ● {} ", name),
+            Style::default().fg(GRAPH_COLORS[*color_idx % GRAPH_COLORS.len()]),
+        ));
+    }
+    lines.push(Line::from(legend_spans));
+    lines.push(Line::raw(""));
+
+    // 2. Gráf rajzolása
+    let nodes = graph.nodes.iter().rev().collect::<Vec<_>>();
+    let num_lanes = 5;
+
+    for lane in 0..num_lanes {
+        let mut lane_spans = Vec::new();
+        lane_spans.push(Span::styled(format!(" Lane {} ", lane), Style::default().fg(Color::DarkGray)));
+
+        for node in &nodes {
+            if node.lane == lane {
+                lane_spans.push(Span::styled(
+                    "●─",
+                    Style::default().fg(GRAPH_COLORS[node.color_idx % GRAPH_COLORS.len()]),
+                ));
+                lane_spans.push(Span::styled(
+                    format!("{} ", node.short_id),
+                    Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+                ));
+            } else {
+                let has_connection = node.parents.iter().any(|p| {
+                    nodes.iter().find(|n| &n.id == p).map(|n| n.lane == lane).unwrap_or(false)
+                });
+
+                if has_connection {
+                    lane_spans.push(Span::styled("───", Style::default().fg(Color::DarkGray)));
+                } else {
+                    lane_spans.push(Span::raw("   "));
+                }
+            }
+        }
+        lines.push(Line::from(lane_spans));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(" (Left: Older commits -> Right: Newer commits) ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)));
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title(" Horizontal Branch Graph • Press g to close "))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn render_top_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -80,28 +163,50 @@ fn render_top_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+fn render_info_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let mut spans = vec![
+        Span::styled(" [s] Settings: ", Style::default().fg(app.theme.subtle)),
+        Span::styled(
+            if app.show_settings { "OPEN " } else { "CLOSED " },
+            if app.show_settings { Style::default().fg(app.theme.accent) } else { Style::default().fg(app.theme.subtle) },
+        ),
+        Span::styled(" [g] Graph: ", Style::default().fg(app.theme.subtle)),
+        Span::styled("HORIZONTAL ", Style::default().fg(app.theme.subtle)),
+    ];
+
+    if app.show_settings {
+        spans.push(Span::styled(" | [t] Terminal: ", Style::default().fg(app.theme.subtle)));
+        spans.push(Span::styled(
+            if app.separate_terminal { "SEPARATE " } else { "MINI " },
+            Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn render_body(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(60), // Bal oszlop
-            Constraint::Percentage(40), // Jobb oszlop
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
         ])
         .split(area);
 
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(70), // Felül: History
-            Constraint::Percentage(30), // Alul: Branchek
+            Constraint::Percentage(70),
+            Constraint::Percentage(30),
         ])
         .split(main_chunks[0]);
 
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(60), // Felül: Commands
-            Constraint::Percentage(40), // Alul: Details
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
         ])
         .split(main_chunks[1]);
 
@@ -245,7 +350,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 
     if app.command_mode {
-        render_builder_overlay(frame, centered_rect(76, 72, frame.area()), app);
+        render_builder_overlay(frame, centered_rect(76, 72, area), app);
     }
 }
 
@@ -271,8 +376,6 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     }
 
-    // Ha a terminál fókuszban van, a felhasználó görgetését használjuk.
-    // Ha nincs, automatikusan az aljára görgetünk.
     let content_height = lines.len() as u16;
     let available_height = area.height.saturating_sub(2);
     
@@ -420,9 +523,11 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::raw("j/k or ↑/↓: move within focused pane"),
         Line::raw("Tab / Shift-Tab: cycle panes"),
         Line::raw("c: open command builder"),
-        Line::raw("h, g, d: focus history/branches/details"),
+        Line::raw("h, b, d: focus history/branches/details"),
         Line::raw("/: filter commit history"),
         Line::raw("Enter: inspect selected commit"),
+        Line::raw("s: toggle settings bar"),
+        Line::raw("g: toggle full branch graph"),
         Line::raw("q: quit / close overlay"),
         Line::raw("?: open this help"),
     ]);
