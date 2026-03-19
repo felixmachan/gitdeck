@@ -1,4 +1,4 @@
-use super::{CommandDoc, CommandOption, CommandSpec, DangerLevel};
+use super::{CommandDoc, CommandOption, CommandSpec, DangerLevel, TargetType};
 
 pub fn command_catalog() -> Vec<CommandSpec> {
     vec![
@@ -23,6 +23,8 @@ fn cmd_status() -> CommandSpec {
         category: "Working Tree",
         base: "status",
         target_label: Some("pathspec"),
+        target_type: TargetType::File,
+        target_format: None,
         docs: CommandDoc {
             description: "Show working tree and index state.",
             when_to_use: "Before committing or when orienting inside a repo.",
@@ -45,6 +47,8 @@ fn cmd_add() -> CommandSpec {
         "Working Tree",
         "add",
         Some("pathspec"),
+        TargetType::File,
+        None,
         "Stage content for next commit.",
         "When you are preparing files to commit.",
         vec!["git add .", "git add -p src/main.rs"],
@@ -68,12 +72,15 @@ fn cmd_add() -> CommandSpec {
         ],
     )
 }
+
 fn cmd_restore() -> CommandSpec {
     mk(
         "restore",
         "Working Tree",
         "restore",
         Some("pathspec"),
+        TargetType::File,
+        None,
         "Restore working tree files.",
         "Discard unstaged edits or unstage files.",
         vec!["git restore src/lib.rs", "git restore --staged Cargo.toml"],
@@ -97,12 +104,15 @@ fn cmd_restore() -> CommandSpec {
         ],
     )
 }
+
 fn cmd_commit() -> CommandSpec {
     mk(
         "commit",
         "History",
         "commit",
-        None,
+        Some("commit message"),
+        TargetType::Text,
+        Some("-m \"{}\""),
         "Record staged changes as a new commit.",
         "After staging a coherent change.",
         vec![
@@ -114,27 +124,25 @@ fn cmd_commit() -> CommandSpec {
         Some("--amend rewrites commit history."),
         vec![
             opt(
-                "message",
-                "Message placeholder",
-                "-m \"<message>\"",
-                "Add inline message (edit preview manually)",
-            ),
-            opt(
                 "all",
                 "All tracked",
                 "-a",
                 "Stage tracked files before commit",
             ),
             opt("amend", "Amend", "--amend", "Rewrite last commit"),
+            opt("no_edit", "No edit", "--no-edit", "Reuse last commit message"),
         ],
     )
 }
+
 fn cmd_switch() -> CommandSpec {
     mk(
         "switch",
         "Branches",
         "switch",
         Some("branch/ref"),
+        TargetType::Branch,
+        None,
         "Switch branches.",
         "Move between branches or detach HEAD.",
         vec!["git switch main", "git switch -c feature/x"],
@@ -152,12 +160,15 @@ fn cmd_switch() -> CommandSpec {
         ],
     )
 }
+
 fn cmd_branch() -> CommandSpec {
     mk(
         "branch",
         "Branches",
         "branch",
         Some("branch"),
+        TargetType::Branch,
+        None,
         "Manage branches.",
         "Create/list/delete local branches.",
         vec!["git branch", "git branch feature/a", "git branch -d old"],
@@ -176,12 +187,15 @@ fn cmd_branch() -> CommandSpec {
         ],
     )
 }
+
 fn cmd_fetch() -> CommandSpec {
     mk(
         "fetch",
         "Remotes",
         "fetch",
         Some("remote"),
+        TargetType::Remote,
+        None,
         "Download refs/objects from remote.",
         "Refresh remote-tracking branches safely.",
         vec!["git fetch", "git fetch origin --prune"],
@@ -199,12 +213,15 @@ fn cmd_fetch() -> CommandSpec {
         ],
     )
 }
+
 fn cmd_pull() -> CommandSpec {
     mk(
         "pull",
         "Remotes",
         "pull",
         Some("remote [branch]"),
+        TargetType::Remote,
+        None,
         "Fetch then integrate remote updates.",
         "Update local branch from tracked remote.",
         vec!["git pull", "git pull --rebase origin main"],
@@ -227,12 +244,15 @@ fn cmd_pull() -> CommandSpec {
         ],
     )
 }
+
 fn cmd_push() -> CommandSpec {
     mk(
         "push",
         "Remotes",
         "push",
         Some("remote branch"),
+        TargetType::Remote,
+        None,
         "Upload commits to remote.",
         "Share your local commits.",
         vec!["git push", "git push --set-upstream origin feature/x"],
@@ -256,11 +276,14 @@ fn cmd_push() -> CommandSpec {
         ],
     )
 }
+
 fn cmd_stash() -> CommandSpec {
     mk(
         "stash",
         "Working Tree",
         "stash",
+        None,
+        TargetType::None,
         None,
         "Temporarily store local modifications.",
         "Quickly shelve changes to switch context.",
@@ -284,12 +307,15 @@ fn cmd_stash() -> CommandSpec {
         ],
     )
 }
+
 fn cmd_diff() -> CommandSpec {
     mk(
         "diff",
         "Inspection",
         "diff",
         Some("pathspec/ref"),
+        TargetType::File,
+        None,
         "Show line-level changes.",
         "Inspect what changed before staging/committing.",
         vec!["git diff", "git diff --staged", "git diff main..feature"],
@@ -303,12 +329,15 @@ fn cmd_diff() -> CommandSpec {
         ],
     )
 }
+
 fn cmd_log() -> CommandSpec {
     mk(
         "log",
         "Inspection",
         "log",
         Some("range/ref"),
+        TargetType::Text,
+        None,
         "Show commit history.",
         "Explore project history and references.",
         vec![
@@ -346,6 +375,8 @@ fn mk(
     category: &'static str,
     base: &'static str,
     target_label: Option<&'static str>,
+    target_type: TargetType,
+    target_format: Option<&'static str>,
     description: &'static str,
     when_to_use: &'static str,
     examples: Vec<&'static str>,
@@ -359,6 +390,8 @@ fn mk(
         category,
         base,
         target_label,
+        target_type,
+        target_format,
         docs: CommandDoc {
             description,
             when_to_use,

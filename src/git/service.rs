@@ -148,7 +148,7 @@ impl GitService {
         Ok(all)
     }
 
-    pub fn stash_count(&self) -> Result<usize> {
+    pub fn stash_count(&mut self) -> Result<usize> {
         let mut count = 0usize;
         self.repo.stash_foreach(|_, _, _| {
             count += 1;

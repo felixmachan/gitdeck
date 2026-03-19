@@ -8,7 +8,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{io, time::Duration};
 
 use crate::{
-    commands::{command_catalog, execute_preview, BuilderState, DangerLevel},
+    commands::{command_catalog, execute_preview, BuilderFocus, BuilderState, DangerLevel, TargetType},
     config::theme::Theme,
     git::GitService,
     models::{
@@ -41,6 +41,7 @@ pub struct App {
     pub command_output: String,
     pub confirm_required: bool,
     pub status_message: String,
+    pub terminal_scroll: u16,
 }
 
 impl App {
@@ -68,6 +69,7 @@ impl App {
             focus: FocusPane::History,
             theme: Theme::default(),
             git,
+            terminal_scroll: 0,
         };
 
         app.refresh_derived_state()?;
@@ -118,7 +120,8 @@ impl App {
         }
 
         match code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => self.should_quit = true,
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.prev(),
             KeyCode::Char('?') => self.show_help = true,
@@ -155,7 +158,6 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> Result<()> {
-        let command_len = self.commands.len();
         let selected = &self.commands[self.builder.selected_command];
 
         match code {
@@ -164,30 +166,60 @@ impl App {
                 self.confirm_required = false;
             }
             KeyCode::Tab => {
-                self.builder.selected_command = (self.builder.selected_command + 1) % command_len;
-                self.builder.reset_for_command();
-            }
-            KeyCode::BackTab => {
-                self.builder.selected_command = if self.builder.selected_command == 0 {
-                    command_len.saturating_sub(1)
-                } else {
-                    self.builder.selected_command - 1
-                };
-                self.builder.reset_for_command();
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let max = selected.toggles.len().saturating_sub(1);
-                self.builder.selected_option = (self.builder.selected_option + 1).min(max);
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.builder.selected_option = self.builder.selected_option.saturating_sub(1);
-            }
-            KeyCode::Char(' ') => {
-                if let Some(opt) = selected.toggles.get(self.builder.selected_option) {
-                    self.builder.toggle_option(opt.key);
+                if selected.target_type != TargetType::None {
+                    self.builder.focus = match self.builder.focus {
+                        BuilderFocus::Options => BuilderFocus::Target,
+                        BuilderFocus::Target => BuilderFocus::Options,
+                    };
                 }
             }
-            KeyCode::Char('x') => {
+            KeyCode::Down | KeyCode::Char('j') => {
+                match self.builder.focus {
+                    BuilderFocus::Options => {
+                        let max = selected.toggles.len().saturating_sub(1);
+                        self.builder.selected_option = (self.builder.selected_option + 1).min(max);
+                    }
+                    BuilderFocus::Target => {
+                        if selected.target_type == TargetType::Branch {
+                            let len = self.branches.len();
+                            if len > 0 {
+                                self.builder.selected_suggestion = (self.builder.selected_suggestion + 1) % len;
+                                self.builder.target_input = self.branches[self.builder.selected_suggestion].name.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                match self.builder.focus {
+                    BuilderFocus::Options => {
+                        self.builder.selected_option = self.builder.selected_option.saturating_sub(1);
+                    }
+                    BuilderFocus::Target => {
+                        if selected.target_type == TargetType::Branch {
+                            let len = self.branches.len();
+                            if len > 0 {
+                                self.builder.selected_suggestion = if self.builder.selected_suggestion == 0 {
+                                    len - 1
+                                } else {
+                                    self.builder.selected_suggestion - 1
+                                };
+                                self.builder.target_input = self.branches[self.builder.selected_suggestion].name.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(' ') => {
+                if self.builder.focus == BuilderFocus::Options {
+                    if let Some(opt) = selected.toggles.get(self.builder.selected_option) {
+                        self.builder.toggle_option(opt.key);
+                    }
+                } else {
+                    self.builder.target_input.push(' ');
+                }
+            }
+            KeyCode::Enter => {
                 let preview = self.builder.preview_command(selected);
                 if matches!(selected.docs.danger_level, DangerLevel::Dangerous)
                     || self.builder.option_enabled("force")
@@ -196,25 +228,25 @@ impl App {
                     if !self.confirm_required {
                         self.confirm_required = true;
                         self.status_message =
-                            "Dangerous action: press x again to confirm execution".to_string();
+                            "Dangerous action: press Enter again to confirm execution".to_string();
                         return Ok(());
                     }
                 }
 
                 self.command_output = execute_preview(&preview).unwrap_or_else(|e| e.to_string());
-                self.status_message = "Command executed".to_string();
+                self.status_message = format!("Executed: git {}", selected.base);
                 self.confirm_required = false;
+                self.command_mode = false; 
+                self.terminal_scroll = 0; // Reset scroll for new output
                 self.refresh_repo_data()?;
             }
-            KeyCode::Enter => {
-                self.command_mode = false;
-                self.confirm_required = false;
-            }
             KeyCode::Backspace => {
-                self.builder.target_input.pop();
+                if self.builder.focus == BuilderFocus::Target {
+                    self.builder.target_input.pop();
+                }
             }
             KeyCode::Char(c) if modifiers.is_empty() => {
-                if selected.target_label.is_some() {
+                if self.builder.focus == BuilderFocus::Target {
                     self.builder.target_input.push(c);
                 }
             }
@@ -251,6 +283,13 @@ impl App {
                     .rem_euclid(len as isize))
                     as usize;
                 self.builder.reset_for_command();
+            }
+            FocusPane::Output => {
+                if delta > 0 {
+                    self.terminal_scroll = self.terminal_scroll.saturating_add(1);
+                } else {
+                    self.terminal_scroll = self.terminal_scroll.saturating_sub(1);
+                }
             }
             FocusPane::Details => {}
         }

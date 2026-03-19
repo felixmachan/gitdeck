@@ -7,6 +7,21 @@ pub enum DangerLevel {
     Dangerous,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetType {
+    None,
+    Text,
+    Branch,
+    File,
+    Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuilderFocus {
+    Options,
+    Target,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandDoc {
     pub description: &'static str,
@@ -31,6 +46,8 @@ pub struct CommandSpec {
     pub category: &'static str,
     pub base: &'static str,
     pub target_label: Option<&'static str>,
+    pub target_type: TargetType,
+    pub target_format: Option<&'static str>, // e.g. "-m \"{}\""
     pub docs: CommandDoc,
     pub toggles: Vec<CommandOption>,
 }
@@ -41,6 +58,8 @@ pub struct BuilderState {
     pub selected_option: usize,
     pub enabled_options: BTreeSet<String>,
     pub target_input: String,
+    pub selected_suggestion: usize, 
+    pub focus: BuilderFocus,
 }
 
 impl BuilderState {
@@ -50,6 +69,8 @@ impl BuilderState {
             selected_option: 0,
             enabled_options: BTreeSet::new(),
             target_input: String::new(),
+            selected_suggestion: 0,
+            focus: BuilderFocus::Options,
         }
     }
 
@@ -57,6 +78,8 @@ impl BuilderState {
         self.selected_option = 0;
         self.enabled_options.clear();
         self.target_input.clear();
+        self.selected_suggestion = 0;
+        self.focus = BuilderFocus::Options;
     }
 
     pub fn toggle_option(&mut self, key: &str) {
@@ -83,9 +106,9 @@ impl BuilderState {
             problems.push("Use either --force OR --force-with-lease, not both".to_string());
         }
 
-        if spec.target_label.is_some() && self.target_input.trim().is_empty() {
-            if spec.id == "switch" || spec.id == "branch" {
-                problems.push("A target branch name/ref is required".to_string());
+        if spec.target_type != TargetType::None && self.target_input.trim().is_empty() {
+            if spec.id == "switch" || spec.id == "branch" || spec.id == "commit" {
+                problems.push("A target (branch name, message, etc.) is required".to_string());
             }
         }
 
@@ -104,14 +127,21 @@ impl BuilderState {
 
         for option in &spec.toggles {
             if self.option_enabled(option.key) {
-                parts.push(option.cli_flag.to_string());
+                if spec.target_format.is_none() || !option.cli_flag.contains("{}") {
+                    parts.push(option.cli_flag.to_string());
+                }
             }
         }
 
-        if let Some(target) = spec.target_label {
-            if !self.target_input.trim().is_empty() {
-                parts.push(self.target_input.trim().to_string());
-            } else if spec.id == "status" && target == "pathspec" {
+        if spec.target_type != TargetType::None {
+            let input = self.target_input.trim();
+            if !input.is_empty() {
+                if let Some(fmt) = spec.target_format {
+                    parts.push(fmt.replace("{}", input));
+                } else {
+                    parts.push(input.to_string());
+                }
+            } else if spec.id == "status" && spec.target_type == TargetType::File {
                 parts.push(".".to_string());
             }
         }

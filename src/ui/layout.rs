@@ -8,18 +8,27 @@ use ratatui::{
 
 use crate::{
     app::App,
-    commands::DangerLevel,
+    commands::{BuilderFocus, DangerLevel, TargetType},
     config::keybindings::FOOTER_KEYS,
     models::{domain::RepoOperation, ui::FocusPane},
 };
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
+    // Dinamikus magasság számítása: ha üres az output, kicsi a footer, ha van benne valami, nagyobb.
+    let footer_height = if app.command_output.trim().is_empty() {
+        3
+    } else {
+        // Maximum 10 sor, de legalább 6, ha van kimenet
+        let lines_count = app.command_output.lines().count() as u16;
+        (lines_count + 4).min(10).max(6)
+    };
+
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(2),
+            Constraint::Fill(1), // Ez a rész (a body) kap meg minden maradék helyet
+            Constraint::Length(footer_height),
         ])
         .split(frame.area());
 
@@ -72,28 +81,42 @@ fn render_top_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_body(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let columns = Layout::default()
+    let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(38),
-            Constraint::Percentage(22),
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
+            Constraint::Percentage(60), // Bal oszlop
+            Constraint::Percentage(40), // Jobb oszlop
         ])
         .split(area);
 
-    render_history(frame, columns[0], app);
-    render_branches(frame, columns[1], app);
-    render_commands(frame, columns[2], app);
-    render_details(frame, columns[3], app);
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(70), // Felül: History
+            Constraint::Percentage(30), // Alul: Branchek
+        ])
+        .split(main_chunks[0]);
+
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(60), // Felül: Commands
+            Constraint::Percentage(40), // Alul: Details
+        ])
+        .split(main_chunks[1]);
+
+    render_history(frame, left_chunks[0], app);
+    render_branches(frame, left_chunks[1], app);
+    render_commands(frame, right_chunks[0], app);
+    render_details(frame, right_chunks[1], app);
 }
 
 fn render_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let active = app.focus == FocusPane::History;
     let title = if app.query.is_empty() {
-        "History"
+        " History "
     } else {
-        "History (filtered)"
+        " History (filtered) "
     };
 
     let items = app
@@ -102,9 +125,9 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .enumerate()
         .map(|(i, idx)| {
             let c = &app.commits[*idx];
-            let prefix = if i == app.selected_commit { ">" } else { " " };
+            let prefix = if i == app.selected_commit && active { ">" } else { " " };
             ListItem::new(format!(
-                "{} {} {} {} {}",
+                "{} {:<8} {:<12} {:<10} {}",
                 prefix,
                 c.short_id,
                 c.author,
@@ -131,13 +154,13 @@ fn render_branches(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|(i, b)| {
             let mark = if b.is_head { "*" } else { " " };
             let remote = if b.is_remote { "(remote)" } else { "(local)" };
-            let selected = if i == app.selected_branch { ">" } else { " " };
-            ListItem::new(format!("{} {} {} {}", selected, mark, b.name, remote))
+            let selected = if i == app.selected_branch && active { ">" } else { " " };
+            ListItem::new(format!("{} {} {:<20} {}", selected, mark, b.name, remote))
         })
         .collect::<Vec<_>>();
 
     frame.render_widget(
-        List::new(items).block(pane_block("Branches / Graph", active, app)),
+        List::new(items).block(pane_block(" Branches ", active, app)),
         area,
     );
 }
@@ -150,17 +173,17 @@ fn render_commands(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, cmd)| {
-            let selected = if idx == app.builder.selected_command {
+            let selected = if idx == app.builder.selected_command && active {
                 ">"
             } else {
                 " "
             };
-            ListItem::new(format!("{} [{}] git {}", selected, cmd.category, cmd.base))
+            ListItem::new(format!("{} [{:<10}] git {}", selected, cmd.category, cmd.base))
         })
         .collect::<Vec<_>>();
 
     frame.render_widget(
-        List::new(items).block(pane_block("Command Center", active, app)),
+        List::new(items).block(pane_block(" Command Center ", active, app)),
         area,
     );
 }
@@ -176,22 +199,31 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .fg(app.theme.accent_alt)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::raw(format!("What: {}", selected.docs.description)),
-        Line::raw(format!("When: {}", selected.docs.when_to_use)),
-        Line::raw(format!("Danger: {:?}", selected.docs.danger_level)),
+        Line::from(vec![
+            Span::styled(" • What: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(selected.docs.description.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled(" • When: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(selected.docs.when_to_use.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled(" • Danger: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!("{:?}", selected.docs.danger_level)),
+        ]),
         Line::raw(""),
     ];
 
     if let Some(details) = &app.commit_details {
-        lines.push(Line::raw(format!("Commit: {}", details.summary.short_id)));
-        lines.push(Line::raw(details.summary.subject.clone()));
+        lines.push(Line::from(vec![
+            Span::styled("Selected Commit: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(&details.summary.short_id),
+        ]));
+        lines.push(Line::raw(format!(" Subject: {}", details.summary.subject)));
         lines.push(Line::raw(format!(
-            "Δ files:{} +{} -{}",
+            " Changes: {} files, +{} -{}",
             details.files_changed, details.insertions, details.deletions
         )));
-        if !details.body.is_empty() {
-            lines.push(Line::raw(details.body.clone()));
-        }
         lines.push(Line::raw(""));
     }
 
@@ -204,14 +236,6 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let preview = app.builder.preview_command(selected);
     lines.push(Line::raw(format!("Preview: {preview}")));
-
-    if !app.command_output.trim().is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::raw("Last output:"));
-        for l in app.command_output.lines().take(8) {
-            lines.push(Line::raw(l.to_string()));
-        }
-    }
 
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -226,7 +250,8 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let status = Line::from(vec![
+    let active = app.focus == FocusPane::Output;
+    let mut lines = vec![Line::from(vec![
         Span::styled("Keys: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(FOOTER_KEYS),
         Span::raw(" • "),
@@ -234,10 +259,36 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app.status_message.as_str(),
             Style::default().fg(app.theme.subtle),
         ),
-    ]);
+    ])];
+
+    if !app.command_output.trim().is_empty() {
+        lines.push(Line::raw(""));
+        for l in app.command_output.lines() {
+            lines.push(Line::from(vec![
+                Span::styled("> ", Style::default().fg(app.theme.accent)),
+                Span::raw(l),
+            ]));
+        }
+    }
+
+    // Ha a terminál fókuszban van, a felhasználó görgetését használjuk.
+    // Ha nincs, automatikusan az aljára görgetünk.
+    let content_height = lines.len() as u16;
+    let available_height = area.height.saturating_sub(2);
+    
+    let scroll = if active {
+        app.terminal_scroll
+    } else if content_height > available_height {
+        content_height - available_height
+    } else {
+        0
+    };
 
     frame.render_widget(
-        Paragraph::new(status).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(Text::from(lines))
+            .block(pane_block(" Mini Terminal / Output ", active, app))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         area,
     );
 }
@@ -254,7 +305,7 @@ fn render_builder_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::raw(
-            "Tab/S-Tab command • j/k option • space toggle • type target • x execute • q close",
+            "Tab/S-Tab command • j/k option • space toggle • type target • Enter execute • q close",
         ),
         Line::raw(""),
     ];
@@ -265,15 +316,23 @@ fn render_builder_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             "[ ]"
         };
-        let cursor = if i == app.builder.selected_option {
+        let is_focused = app.builder.focus == BuilderFocus::Options && i == app.builder.selected_option;
+        let cursor = if is_focused {
             ">"
         } else {
             " "
         };
-        lines.push(Line::raw(format!(
-            "{} {} {} ({})",
-            cursor, marker, opt.label, opt.cli_flag
-        )));
+        let style = if is_focused {
+            Style::default().fg(app.theme.accent)
+        } else {
+            Style::default()
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} {} ", cursor, marker), style),
+            Span::raw(opt.label),
+            Span::raw(format!(" ({})", opt.cli_flag)),
+        ]));
         lines.push(Line::from(vec![
             Span::raw("    "),
             Span::styled(opt.help, Style::default().fg(app.theme.subtle)),
@@ -282,10 +341,36 @@ fn render_builder_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     lines.push(Line::raw(""));
     if let Some(label) = selected.target_label {
-        lines.push(Line::raw(format!(
-            "Target {label}: {}",
-            app.builder.target_input
-        )));
+        let is_focused = app.builder.focus == BuilderFocus::Target;
+        let style = if is_focused {
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        let cursor = if is_focused { "> " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(cursor, style),
+            Span::styled(format!("{}: ", label), style),
+            Span::raw(app.builder.target_input.clone()),
+            if is_focused {
+                Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK))
+            } else {
+                Span::raw("")
+            },
+        ]));
+
+        if is_focused && selected.target_type == TargetType::Branch {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    "↑/↓ to cycle branches",
+                    Style::default().fg(app.theme.subtle),
+                ),
+            ]));
+        }
     }
 
     let preview = app.builder.preview_command(selected);
@@ -308,7 +393,7 @@ fn render_builder_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     if matches!(selected.docs.danger_level, DangerLevel::Dangerous) || app.confirm_required {
         lines.push(Line::from(Span::styled(
-            "Dangerous command path detected. Press x twice to execute.",
+            "Dangerous command path detected. Press Enter twice to execute.",
             Style::default().fg(app.theme.danger),
         )));
     }
@@ -351,7 +436,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-fn pane_block(title: &str, active: bool, app: &App) -> Block<'_> {
+fn pane_block<'a>(title: &'a str, active: bool, app: &'a App) -> Block<'a> {
     let style = if active {
         Style::default()
             .fg(app.theme.accent)
